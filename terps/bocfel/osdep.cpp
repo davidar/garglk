@@ -765,6 +765,20 @@ static std::unique_ptr<std::string> data_file(const std::string &filename)
 
 std::unique_ptr<std::string> zterp_os_autosave_name()
 {
+    // If autosave_directory is explicitly set, use it
+    if (options.autosave_directory != nullptr) {
+        auto uname = unique_name();
+        if (uname == nullptr) {
+            return nullptr;
+        }
+        std::string filename = *options.autosave_directory + "\\"s + *uname;
+        if (!mkdir_p(filename)) {
+            return nullptr;
+        }
+        return std::make_unique<std::string>(filename);
+    }
+
+    // Default: use %APPDATA%\Bocfel\autosave\ directory
     auto filename = unique_name();
 
     if (filename == nullptr) {
