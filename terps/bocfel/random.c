@@ -21,6 +21,9 @@
 #include <stdint.h>
 #include <limits.h>
 #include <time.h>
+#include <string.h>
+
+#include "autosave.h"
 
 #include "random.h"
 #include "process.h"
@@ -75,6 +78,22 @@ static uint32_t zterp_rand(void)
 
 static int rng_interval = 0;
 static int rng_counter  = 0;
+
+void autosave_random_capture(uint32_t state[627])
+{
+  memcpy(state, mt, sizeof mt);
+  state[624] = mt_idx;
+  state[625] = rng_interval;
+  state[626] = rng_counter;
+}
+
+void autosave_random_apply(const uint32_t state[627])
+{
+  memcpy(mt, state, sizeof mt);
+  mt_idx = state[624];
+  rng_interval = state[625];
+  rng_counter = state[626];
+}
 
 /* Called with 0, seed the PRNG with either
  * a) a user-provided seed (via -z) if available, or

@@ -25,6 +25,7 @@ enum zterp_io_purpose
 zterp_io *zterp_io_open(const char *, enum zterp_io_mode, enum zterp_io_purpose);
 const zterp_io *zterp_io_stdin(void);
 const zterp_io *zterp_io_stdout(void);
+bool zterp_io_sync(zterp_io *);
 void zterp_io_close(zterp_io *);
 bool zterp_io_seek(const zterp_io *, long, int);
 long zterp_io_tell(const zterp_io *);

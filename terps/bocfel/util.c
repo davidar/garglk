@@ -23,6 +23,7 @@
 #include <stdbool.h>
 
 #include "util.h"
+#include "autosave.h"
 #include "process.h"
 #include "screen.h"
 #include "unicode.h"
@@ -180,7 +181,7 @@ void process_arguments(int argc, char **argv)
 {
   int c;
 
-  while( (c = zgetopt(argc, argv, "a:A:cCdDeE:fFgGhikl:mn:N:prR:sS:tT:u:UvxXyYz:Z:")) != -1 )
+  while( (c = zgetopt(argc, argv, "a:A:cCdDeE:fFgGhikl:mn:N:pq:rR:sS:tT:u:UvxXyYz:Z:")) != -1 )
   {
     switch(c)
     {
@@ -243,6 +244,9 @@ void process_arguments(int argc, char **argv)
         break;
       case 'p':
         options.disable_patches = true;
+        break;
+      case 'q':
+        autosave_path = zoptarg;
         break;
       case 'r':
         options.replay_on = true;

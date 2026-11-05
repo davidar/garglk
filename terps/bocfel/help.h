@@ -18,6 +18,7 @@
 { "-n", glkunix_arg_NumberValue, "Set the interpreter number (see 11.1.3 in The Z-machine Standards Document 1.0)" },
 { "-N", glkunix_arg_ValueFollows, "Set the interpreter version to the single-character version (see 11.1.3.1 in The Z-machine Standards Document 1.0)" },
 { "-p", glkunix_arg_NoValue, "Disable the application of patches" },
+{ "-q", glkunix_arg_ValueFollows, "Automatically checkpoint and resume using this private file" },
 { "-r", glkunix_arg_NoValue, "Play back a command record" },
 { "-R", glkunix_arg_ValueFollows, "Specify the filename for the command record replay" },
 { "-s", glkunix_arg_NoValue, "Turn on command recording" },
