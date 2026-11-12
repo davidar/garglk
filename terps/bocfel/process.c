@@ -27,6 +27,7 @@
 #endif
 
 #include "process.h"
+#include "autosave.h"
 #include "branch.h"
 #include "dict.h"
 #include "math.h"
@@ -344,6 +345,9 @@ void process_instructions(void)
 #if defined(ZTERP_GLK) && defined(ZTERP_GLK_TICK)
     glk_tick();
 #endif
+
+    // Checkpoint before operand decoding: variable operands can pop the VM stack.
+    if((byte(pc) == 0xe4 || byte(pc) == 0xf6) && autosave_checkpoint()) continue;
 
     current_instruction = pc;
     opcode = byte(pc++);

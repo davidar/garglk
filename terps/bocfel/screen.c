@@ -29,6 +29,7 @@
 #endif
 
 #include "screen.h"
+#include "autosave.h"
 #include "branch.h"
 #include "dict.h"
 #include "io.h"
@@ -193,7 +194,67 @@ static const int style_map[] =
 
 #ifdef ZTERP_GLK
 /* This macro makes it so that code elsewhere needn’t check have_unicode before printing. */
-#define GLK_PUT_CHAR(c)		do { if(!have_unicode) glk_put_char(unicode_to_latin1[c]); else glk_put_char_uni(c); } while(0)
+static struct autosave_screen autoscreen;
+static uint32_t autoscreen_x, autoscreen_y;
+static bool autoscreen_input;
+
+static void autosave_resize_grid(glui32 width, glui32 height)
+{
+  // Glk discards cells outside the retained rectangle when a grid shrinks.
+  for(unsigned y = 0; y < 64; y++)
+    for(unsigned x = 0; x < 256; x++)
+      if(y >= height || x >= width) autoscreen.grid[y][x] = 0;
+}
+
+static void autosave_put_char(uint16_t c)
+{
+  if(autosave_path != NULL)
+  {
+    unsigned style = style_window->style;
+    if(header_fixed_font || curwin->font == FONT_FIXED) style |= STYLE_FIXED;
+    uint32_t cell = c | ((style & 15) << 16) | (autoscreen_input ? 1U << 20 : 0);
+    if(curwin == mainwin)
+    {
+      unsigned capacity = sizeof autoscreen.text / sizeof *autoscreen.text;
+      autoscreen.text[(autoscreen.start + autoscreen.length) % capacity] = cell;
+      if(autoscreen.length == capacity) autoscreen.start = (autoscreen.start + 1) % capacity;
+      else autoscreen.length++;
+    }
+    else if(curwin == upperwin)
+    {
+      if(c == UNICODE_LINEFEED) { autoscreen_x = 0; autoscreen_y++; }
+      else
+      {
+        if(autoscreen_y < 64 && autoscreen_x < 256)
+          autoscreen.grid[autoscreen_y][autoscreen_x] = cell;
+        if(++autoscreen_x >= upper_window_width) { autoscreen_x = 0; autoscreen_y++; }
+      }
+    }
+  }
+  if(!have_unicode) glk_put_char(unicode_to_latin1[c]);
+  else glk_put_char_uni(c);
+}
+
+static void autosave_clear_window(winid_t id)
+{
+  if(id == mainwin->id) autoscreen.start = autoscreen.length = 0;
+  if(id == upperwin->id)
+  {
+    memset(autoscreen.grid, 0, sizeof autoscreen.grid);
+    autoscreen_x = autoscreen_y = 0;
+  }
+  glk_window_clear(id);
+}
+
+static void autosave_move_cursor(winid_t id, glui32 x, glui32 y)
+{
+  if(id == upperwin->id) { autoscreen_x = x; autoscreen_y = y; }
+  glk_window_move_cursor(id, x, y);
+}
+
+#define GLK_PUT_CHAR(c) autosave_put_char(c)
+#define glk_window_clear(id) autosave_clear_window(id)
+#define glk_window_move_cursor(id, x, y) autosave_move_cursor(id, x, y)
 
 /* Yes, there are three ways to indicate that a fixed-width font should be used. */
 #define use_fixed_font() (header_fixed_font || curwin->font == FONT_FIXED || (style & STYLE_FIXED))
@@ -286,8 +347,10 @@ static void cleanup_screen(struct input *input)
   if(curwin->has_echo)
   {
     glk_set_style(style_Input);
+    autoscreen_input = true;
     for(int i = 0; i < input->len; i++) GLK_PUT_CHAR(input->line[i]);
-    if(input->term == ZSCII_NEWLINE) glk_put_char(UNICODE_LINEFEED);
+    if(input->term == ZSCII_NEWLINE) GLK_PUT_CHAR(UNICODE_LINEFEED);
+    autoscreen_input = false;
     set_current_style();
   }
 }
@@ -692,7 +755,7 @@ static bool saw_input;
 
 static void update_delayed(void)
 {
-  glui32 height;
+  glui32 width, height;
 
   if(delayed_window_shrink == -1 || upperwin->id == NULL) return;
 
@@ -702,7 +765,9 @@ static void update_delayed(void)
   /* Glk might resize the window to a smaller height than was requested,
    * so track the actual height, not the requested height.
    */
-  glk_window_get_size(upperwin->id, NULL, &height);
+  glk_window_get_size(upperwin->id, &width, &height);
+  upper_window_width = width;
+  autosave_resize_grid(width, height);
   if(height != upper_window_height)
   {
     /* This message probably won’t be seen in a window since the upper
@@ -2478,4 +2543,117 @@ void init_screen(void)
   streams = STREAM_SCREEN;
   stablei = -1;
   set_current_window(mainwin);
+}
+
+bool autosave_capture(struct autosave_screen *screen)
+{
+#ifdef ZTERP_GLK
+  // Do not checkpoint input inside memory output, command replay or the upper grid.
+  if(zversion == 6 || curwin != mainwin || !(streams & STREAM_SCREEN) || (streams & STREAM_MEMORY) ||
+     istream != ISTREAM_KEYBOARD || upper_window_height > 64 || upper_window_width > 256)
+    return false;
+  *screen = autoscreen;
+  screen->x = upperwin->x;
+  screen->y = upperwin->y;
+  screen->height = upper_window_height;
+  screen->delayed_height = delayed_window_shrink;
+  screen->style = mainwin->style;
+  for(int i = 0; i < 2; i++)
+  {
+    screen->font[i] = windows[i].font;
+    screen->previous_font[i] = windows[i].prev_font;
+  }
+#ifdef GARGLK
+  screen->foreground = fg_color;
+  screen->background = bg_color;
+#endif
+  autosave_random_capture(screen->random);
+  return true;
+#else
+  return false;
+#endif
+}
+
+bool autosave_valid(const struct autosave_screen *screen)
+{
+  if(screen->length > 32768 || screen->start >= 32768 || screen->height > 64 ||
+     screen->x > 256 || screen->y > 64 || screen->style > 15 ||
+     (screen->delayed_height != UINT32_MAX && screen->delayed_height > 64) ||
+     screen->random[624] >= 624 || screen->random[625] >= 1000 || screen->random[626] >= 1000)
+    return false;
+  for(int i = 0; i < 2; i++)
+    if(screen->font[i] > FONT_FIXED ||
+       (screen->previous_font[i] != UINT32_MAX && screen->previous_font[i] > FONT_FIXED))
+      return false;
+  return true;
+}
+
+#ifdef ZTERP_GLK
+static unsigned autosave_replay_style;
+static void autosave_replay_cell(uint32_t cell)
+{
+  unsigned style = (cell >> 16) & 31;
+  if(style != autosave_replay_style)
+  {
+#ifdef GARGLK
+    glk_set_style((style & 16) ? style_Input : style_map[style]);
+    garglk_set_reversevideo(style & STYLE_REVERSE);
+#else
+    glk_set_style((style & 16) ? style_Input : style_Normal);
+#endif
+    autosave_replay_style = style;
+  }
+  if(have_unicode) glk_put_char_uni(cell & 0xffff);
+  else glk_put_char(unicode_to_latin1[cell & 0xffff]);
+}
+#endif
+
+void autosave_apply(const struct autosave_screen *screen)
+{
+#ifdef ZTERP_GLK
+  cancel_all_events();
+  clear_window(mainwin);
+  saw_input = true;
+  resize_upper_window(screen->height);
+  clear_window(upperwin);
+  autoscreen = *screen;
+  autosave_resize_grid(upper_window_width, upper_window_height);
+#ifdef GARGLK
+  fg_color = screen->foreground;
+  bg_color = screen->background;
+  garglk_set_zcolors(fg_color, bg_color);
+#endif
+  glk_set_window(mainwin->id);
+  autosave_replay_style = UINT_MAX;
+  for(uint32_t i = 0; i < screen->length; i++)
+    autosave_replay_cell(screen->text[(screen->start + i) % 32768]);
+  if(upperwin->id != NULL)
+  {
+    glk_set_window(upperwin->id);
+    autosave_replay_style = UINT_MAX;
+#ifdef GARGLK
+    garglk_set_zcolors(fg_color, bg_color);
+#endif
+    for(uint32_t y = 0; y < screen->height && y < upper_window_height; y++)
+      for(uint32_t x = 0; x < 256 && x < upper_window_width; x++)
+        if(screen->grid[y][x] != 0)
+        {
+          glk_window_move_cursor(upperwin->id, x, y);
+          autosave_replay_cell(screen->grid[y][x]);
+        }
+    upperwin->x = screen->x;
+    upperwin->y = screen->y;
+    glk_window_move_cursor(upperwin->id, upperwin->x, upperwin->y);
+  }
+  delayed_window_shrink = (int32_t)screen->delayed_height;
+  for(int i = 0; i < 2; i++)
+  {
+    windows[i].font = screen->font[i];
+    windows[i].prev_font = (int32_t)screen->previous_font[i];
+  }
+  mainwin->style = screen->style;
+  set_current_window(mainwin);
+  autosave_random_apply(screen->random);
+  if(zversion <= 3) zshow_status();
+#endif
 }

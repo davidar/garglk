@@ -29,6 +29,9 @@
 #endif
 
 #include "io.h"
+#ifdef __ANDROID__
+#include <unistd.h>
+#endif
 #include "osdep.h"
 #include "unicode.h"
 
@@ -186,6 +189,18 @@ const zterp_io *zterp_io_stdout(void)
   }
 
   return &io;
+}
+
+bool zterp_io_sync(zterp_io *io)
+{
+#ifdef ZTERP_GLK
+  if(io->type != IO_STDIO) return false;
+#endif
+  if(fflush(io->fp) != 0 || ferror(io->fp)) return false;
+#ifdef __ANDROID__
+  if(fsync(fileno(io->fp)) != 0) return false;
+#endif
+  return true;
 }
 
 void zterp_io_close(zterp_io *io)

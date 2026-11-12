@@ -23,8 +23,10 @@
 #include <stdbool.h>
 #include <setjmp.h>
 #include <time.h>
+#include <errno.h>
 
 #include "stack.h"
+#include "autosave.h"
 #include "branch.h"
 #include "iff.h"
 #include "io.h"
@@ -1059,6 +1061,9 @@ static bool restore_quetzal(zterp_io *savefile, bool is_meta)
     goto_err("wrong game or version");
   }
 
+  if(((uint32_t)ifhd[10] << 16 | (uint32_t)ifhd[11] << 8 | ifhd[12]) >= memory_size)
+    goto_err("invalid program counter");
+
   memory_snapshot();
 
   if(zterp_iff_find(iff, "CMem", &size))
@@ -1071,6 +1076,7 @@ static bool restore_quetzal(zterp_io *savefile, bool is_meta)
      */
     if(size > 131072) goto_err("reported CMem size too large (%lu bytes)", (unsigned long)size);
     buf = malloc(size * sizeof *buf);
+    if(buf == NULL) goto_err("unable to allocate compressed memory");
 
     if(zterp_io_read(savefile, buf, size) != size)
     {
@@ -1108,7 +1114,8 @@ static bool restore_quetzal(zterp_io *savefile, bool is_meta)
     uint16_t nstack;
     uint8_t nargs = 0;
 
-    if(zterp_io_read(savefile, frame, sizeof frame) != sizeof frame) goto_death("unexpected eof reading stack frame");
+    if(size - n < sizeof frame || zterp_io_read(savefile, frame, sizeof frame) != sizeof frame)
+      goto_death("unexpected eof reading stack frame");
     n += sizeof frame;
 
     nlocals = frame[3] & 0xf;
@@ -1116,6 +1123,8 @@ static bool restore_quetzal(zterp_io *savefile, bool is_meta)
     frame[5]++;
     while(frame[5] >>= 1) nargs++;
 
+    if(fp == TOP_OF_FRAMES || nstack > TOP_OF_STACK - sp ||
+       size - n < 2U * (nlocals + nstack)) goto_death("invalid stack frame size");
     add_frame((frame[0] << 16) | (frame[1] << 8) | frame[2], sp, nlocals, nargs, (frame[3] & 0x10) ? 0xff + 1 : frame[4]);
 
     for(int i = 0; i < nlocals; i++)
@@ -1250,6 +1259,100 @@ bool do_restore(bool is_meta)
   }
 
   return success;
+}
+
+const char *autosave_path;
+
+bool autosave_checkpoint(void)
+{
+  static bool checked_restore, warned;
+  if(autosave_path == NULL || zversion == 6 || in_interrupt()) return false;
+
+  struct autosave_screen *screen = malloc(sizeof *screen);
+  char *temporary = malloc(strlen(autosave_path) + 12);
+  if(screen == NULL || temporary == NULL)
+  {
+    free(screen);
+    free(temporary);
+    autosave_path = NULL;
+    warning("Not enough memory for autosave; the existing checkpoint has been kept.");
+    return false;
+  }
+  if(!autosave_capture(screen)) { free(screen); free(temporary); return false; }
+  sprintf(temporary, "%s.new", autosave_path);
+
+  if(!checked_restore)
+  {
+    checked_restore = true;
+    zterp_io *file = zterp_io_open(autosave_path, ZTERP_IO_RDONLY, ZTERP_IO_SAVE);
+    if(file == NULL && errno != ENOENT)
+    {
+      warning("Autosave could not be opened; automatic saving is disabled for this session.");
+      autosave_path = NULL;
+      free(screen);
+      free(temporary);
+      return false;
+    }
+    if(file != NULL)
+    {
+      uint32_t size;
+      uint16_t flags2 = word(0x10);
+      zterp_iff *iff = zterp_iff_parse(file, "BFMS");
+      bool valid = iff != NULL && zterp_iff_find(iff, "FAS1", &size) &&
+        size == sizeof *screen && zterp_io_read(file, screen, size) == size && autosave_valid(screen);
+      zterp_iff_free(iff);
+      bool restored = valid && zterp_io_seek(file, 0, SEEK_SET) && restore_quetzal(file, true);
+      zterp_io_close(file);
+      if(restored)
+      {
+        flags2 = (word(0x10) & ~FLAGS2_TRANSCRIPT) | (flags2 & FLAGS2_TRANSCRIPT);
+        write_header();
+        store_word(0x10, flags2);
+        header_fixed_font = flags2 & FLAGS2_FIXED;
+        // Fresh startup may have created undo states unrelated to the restored VM.
+        clear_save_stack(&save_stacks[SAVE_GAME]);
+        clear_save_stack(&save_stacks[SAVE_USER]);
+        seen_save_undo = false;
+        autosave_apply(screen);
+        free(screen);
+        free(temporary);
+        return true;
+      }
+      // Preserve a rejected checkpoint instead of silently overwriting the evidence.
+      sprintf(temporary, "%s.rejected", autosave_path);
+      if(rename(autosave_path, temporary) != 0) autosave_path = NULL;
+      warning("Autosave could not be resumed; starting normally. The checkpoint was kept.");
+      free(screen);
+      free(temporary);
+      return false;
+    }
+  }
+
+  zterp_io *file = zterp_io_open(temporary, ZTERP_IO_WRONLY, ZTERP_IO_SAVE);
+  bool saved = false;
+  if(file != NULL)
+  {
+    saved = save_quetzal(file, true) && zterp_io_seek(file, 0, SEEK_END);
+    uint32_t size = sizeof *screen;
+    uint8_t chunk[] = { 'F', 'A', 'S', '1', size >> 24, size >> 16, size >> 8, size };
+    saved = saved && zterp_io_write(file, chunk, sizeof chunk) == sizeof chunk &&
+      zterp_io_write(file, screen, size) == size;
+    long form_size = zterp_io_tell(file) - 8;
+    uint8_t form[] = { form_size >> 24, form_size >> 16, form_size >> 8, form_size };
+    saved = saved && form_size > 0 && zterp_io_seek(file, 4, SEEK_SET) &&
+      zterp_io_write(file, form, sizeof form) == sizeof form && zterp_io_sync(file);
+    zterp_io_close(file);
+    saved = saved && rename(temporary, autosave_path) == 0;
+  }
+  if(!saved)
+  {
+    remove(temporary);
+    if(!warned) warning("Autosave failed; the previous checkpoint has been kept.");
+  }
+  warned = !saved;
+  free(temporary);
+  free(screen);
+  return false;
 }
 
 void zrestore(void)
